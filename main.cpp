@@ -53,6 +53,7 @@ struct Connection
   Connection(const std::string& filename)
     : filename_(filename)
     , peer_connection_(std::make_shared<rtc::PeerConnection>())
+    , prevvideotimestamp_(0)
   {
   }
 
@@ -191,8 +192,8 @@ struct Connection
               while (size > 5)
               {
                 const uint32_t nal_size = htonl(*reinterpret_cast<const uint32_t*>(ptr));
-                ptr += 4;
-                size -= 4;
+                //TODO ptr += 4;
+                //TODO size -= 4;
                 if (nal_size > size)
                 {
                   std::cout << "Illegal NAL size " << nal_size << std::endl;
@@ -200,37 +201,54 @@ struct Connection
                 }
                 if (spspps.size()) // We should always have extra data, but if for some reason we don't, there is no point seeing if we should add nothing
                 {
-                  /*bool idrslice = false;
+                  bool idrslice = false;
                   bool sps = false;
                   bool pps = false;
-                  for (size_t i = 0; i < (buf.size() - 4); ++i)
-                  {
-                    if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
-                    {
-                      const decoder::H264_NAL_TYPE naltype = static_cast<decoder::H264_NAL_TYPE>(buf[i + 4] & 0x1f);
-                      if (naltype == decoder::H264_NAL_TYPE::IDR_SLICE)
-                      {
-                        idrslice = true;
-                        break;
-                      }
-                      else if (naltype == decoder::H264_NAL_TYPE::SPS)
-                      {
-                        sps = true;
-                      }
-                      else if (naltype == decoder::H264_NAL_TYPE::PPS)
-                      {
-                        pps = true;
-                      }
-                    }
-                  }
-                  if (idrslice && (sps == false) && (pps == false)) // If we are an iframe and we don't have an sps or pps before the IDR, then insert the sprop-parameter-set extra adata SPS and PPS
-                  {
-                    buf.insert(buf.begin(), extradata.begin(), extradata.end());
-                  }*/
+                  //TODO for (size_t i = 0; i < (buf.size() - 4); ++i)
+                  //TODO {
+                  //TODO   if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
+                  //TODO   {
+                  //TODO     const decoder::H264_NAL_TYPE naltype = static_cast<decoder::H264_NAL_TYPE>(buf[i + 4] & 0x1f);
+                  //TODO     if (naltype == decoder::H264_NAL_TYPE::IDR_SLICE)
+                  //TODO     {
+                  //TODO       idrslice = true;
+                  //TODO       break;
+                  //TODO     }
+                  //TODO     else if (naltype == decoder::H264_NAL_TYPE::SPS)
+                  //TODO     {
+                  //TODO       sps = true;
+                  //TODO     }
+                  //TODO     else if (naltype == decoder::H264_NAL_TYPE::PPS)
+                  //TODO     {
+                  //TODO       pps = true;
+                  //TODO     }
+                  //TODO   }
+                  //TODO }
+                  //TODO if (idrslice && (sps == false) && (pps == false)) // If we are an iframe and we don't have an sps or pps before the IDR, then insert the sprop-parameter-set extra adata SPS and PPS
+                  //TODO {
+                  //TODO   buf.insert(buf.begin(), extradata.begin(), extradata.end());
+                  //TODO }
+                }
+                auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();//TODO
+                double elapsed;
+                if (prevvideotimestamp_)
+                {
+                  elapsed = static_cast<double>(timestamp - prevvideotimestamp_) / 1000.0;
+                }
+                else
+                {
+                  elapsed = 0.0;
+                }
+                prevvideotimestamp_ = timestamp;
+                videosrreporter_->rtpConfig->timestamp += videosrreporter_->rtpConfig->secondsToTimestamp(elapsed);
+                const uint32_t reportedelapsed = videosrreporter_->rtpConfig->timestamp - videosrreporter_->lastReportedTimestamp();
+                if (videosrreporter_->rtpConfig->timestampToSeconds(reportedelapsed) > 1.0) // RTCP report every second
+                {
+                  videosrreporter_->setNeedsToReport();
                 }
                 auto a = rtcvideotrack_->send(reinterpret_cast<const std::byte*>(ptr), size);
                 //TODO
-                std::cout << (a ? "true" : "false") << nal_size << std::endl;//TODO
+                std::cout << (a ? "true" : "false") << nal_size << " " << (int)ptr[0] << " " << (int)ptr[1] << " " << (int)ptr[2] << " " << (int)ptr[3] << " " << (int)ptr[4] << " " << std::endl;//TODO
                 //TODO now do something with the frame
 
                 ptr += nal_size;
@@ -247,6 +265,7 @@ struct Connection
   std::shared_ptr<rtc::PeerConnection> peer_connection_;
   std::shared_ptr<rtc::Track> rtcvideotrack_;
   std::shared_ptr<rtc::RtcpSrReporter> videosrreporter_;
+  uint64_t prevvideotimestamp_;
 
 };
 
