@@ -48,6 +48,208 @@ void sig(const int signum)
 }
 #endif
 
+struct Connection
+{
+  Connection(const std::string& filename)
+    : filename_(filename)
+    , peer_connection_(std::make_shared<rtc::PeerConnection>())
+  {
+  }
+
+  void Start()
+  {
+    //TODO store this
+    std::thread([this]()
+      {
+        // Open the file
+        std::cout << "Opening the file: " << filename_ << std::endl;
+        AVFormatContext* format_context = nullptr;
+        if (avformat_open_input(&format_context, filename_.c_str(), nullptr, nullptr) != 0)
+        {
+          std::cout << "Failed to open avformat file: " << filename_ << std::endl;
+          return;
+        }
+        BOOST_SCOPE_EXIT(format_context)
+        {
+          avformat_close_input(&format_context);
+        }
+        BOOST_SCOPE_EXIT_END
+          if (avformat_find_stream_info(format_context, nullptr) < 0)
+          {
+            std::cout << "Failed to find stream info: " << filename_ << std::endl;
+            return;
+          }
+        std::optional<unsigned int> videostream;
+        for (unsigned int i = 0; i < format_context->nb_streams; i++)
+        {
+          if ((format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) && (format_context->streams[i]->codecpar->codec_id == AVCodecID::AV_CODEC_ID_H264)) // Currently only support H264
+          {
+            videostream = i;
+            break;
+          }
+        }
+        if (!videostream.has_value())
+        {
+          std::cout << "Failed to find video stream: " << filename_ << std::endl;
+          return;
+        }
+        // Find SPS/PPS if available and pass it to the decoder
+        std::vector<uint8_t> spspps;
+        if (format_context->streams[*videostream]->codecpar->extradata && format_context->streams[*videostream]->codecpar->extradata_size)
+        {
+          const std::vector<uint8_t> extradata(format_context->streams[*videostream]->codecpar->extradata, format_context->streams[*videostream]->codecpar->extradata + format_context->streams[*videostream]->codecpar->extradata_size);
+          if (extradata.size())
+          {
+            if (extradata[0] >= 1) // SPS+PPS count, but we only care about the first one
+            {
+              const int spscount = extradata[5] & 0x1f;
+              const int spsnalsize = (extradata[6] << 8) | extradata[7];
+              if ((spsnalsize + 8) <= extradata.size())
+              {
+                std::cout << "Gathering SPS: " << spsnalsize << std::endl;
+                spspps.insert(spspps.end(), extradata.data() + 8, extradata.data() + 8 + spsnalsize);
+                if ((spsnalsize + 8 + 1) <= extradata.size())
+                {
+                  const int ppscount = extradata[8 + spsnalsize] & 0x1f;
+                  if (ppscount >= 1)
+                  {
+                    if ((spsnalsize + 8 + 1 + 2) < extradata.size())
+                    {
+                      const int ppsnalsize = (extradata[8 + spsnalsize + 1] << 8) | extradata[8 + spsnalsize + 2];
+                      if ((spsnalsize + 8 + 1 + 2 + ppsnalsize) <= extradata.size())
+                      {
+                        std::cout << "Gathering PPS: " << ppsnalsize << std::endl;
+                        spspps.insert(spspps.end(), H264_START_SEQUENCE, H264_START_SEQUENCE + sizeof(H264_START_SEQUENCE));
+                        spspps.insert(spspps.end(), extradata.data() + 8 + spsnalsize + 3, extradata.data() + 8 + spsnalsize + 3 + ppsnalsize);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (spspps.size())
+        {
+          //TODO?
+        }
+        // Main loop
+        std::cout << "Starting main loop" << std::endl;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        static double time_base = static_cast<double>(format_context->streams[*videostream]->time_base.num) / static_cast<double>(format_context->streams[*videostream]->time_base.den);
+        AVPacket* av_packet = nullptr;
+        BOOST_SCOPE_EXIT(&av_packet)
+        {
+          if (av_packet)
+          {
+            av_packet_free(&av_packet);
+          }
+        }
+        BOOST_SCOPE_EXIT_END
+          // Start main loop
+          while (running)
+          {
+            // Calculate time of frame
+            if (av_packet)
+            {
+              const double av_packet_time = static_cast<double>(av_packet->pts) * time_base;
+              const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+              if (now >= (start + std::chrono::milliseconds(static_cast<int>(av_packet_time * 1000.0))))
+              {
+                av_packet_free(&av_packet);
+              }
+            }
+            // Read frame from file
+            if (av_packet == nullptr)
+            {
+              av_packet = av_packet_alloc();
+              int ret = av_read_frame(format_context, av_packet);
+              if (ret == AVERROR_EOF)
+              {
+                ret = av_seek_frame(format_context, *videostream, 0, AVSEEK_FLAG_ANY);
+                if (ret < 0)
+                {
+                  std::cout << "Failed to seek frame" << std::endl;
+                  return;
+                }
+                start = std::chrono::steady_clock::now();
+              }
+              else if (ret)
+              {
+                std::cout << "Failed to seek frame" << std::endl;
+                return;
+              }
+              // Video
+              if (av_packet->stream_index != *videostream)
+              {
+                av_packet_free(&av_packet);
+                continue;
+              }
+              // Send
+              const uint8_t* ptr = av_packet->data;
+              size_t size = av_packet->size;
+              while (size > 5)
+              {
+                const uint32_t nal_size = htonl(*reinterpret_cast<const uint32_t*>(ptr));
+                ptr += 4;
+                size -= 4;
+                if (nal_size > size)
+                {
+                  std::cout << "Illegal NAL size " << nal_size << std::endl;
+                  break;
+                }
+                if (spspps.size()) // We should always have extra data, but if for some reason we don't, there is no point seeing if we should add nothing
+                {
+                  /*bool idrslice = false;
+                  bool sps = false;
+                  bool pps = false;
+                  for (size_t i = 0; i < (buf.size() - 4); ++i)
+                  {
+                    if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
+                    {
+                      const decoder::H264_NAL_TYPE naltype = static_cast<decoder::H264_NAL_TYPE>(buf[i + 4] & 0x1f);
+                      if (naltype == decoder::H264_NAL_TYPE::IDR_SLICE)
+                      {
+                        idrslice = true;
+                        break;
+                      }
+                      else if (naltype == decoder::H264_NAL_TYPE::SPS)
+                      {
+                        sps = true;
+                      }
+                      else if (naltype == decoder::H264_NAL_TYPE::PPS)
+                      {
+                        pps = true;
+                      }
+                    }
+                  }
+                  if (idrslice && (sps == false) && (pps == false)) // If we are an iframe and we don't have an sps or pps before the IDR, then insert the sprop-parameter-set extra adata SPS and PPS
+                  {
+                    buf.insert(buf.begin(), extradata.begin(), extradata.end());
+                  }*/
+                }
+                auto a = rtcvideotrack_->send(reinterpret_cast<const std::byte*>(ptr), size);
+                //TODO
+                std::cout << (a ? "true" : "false") << nal_size << std::endl;//TODO
+                //TODO now do something with the frame
+
+                ptr += nal_size;
+                size -= nal_size;
+              }
+            }
+            // Delay loop
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+      }).detach();//TODO
+  }
+
+  const std::string filename_;
+  std::shared_ptr<rtc::PeerConnection> peer_connection_;
+  std::shared_ptr<rtc::Track> rtcvideotrack_;
+  std::shared_ptr<rtc::RtcpSrReporter> videosrreporter_;
+
+};
+
 std::vector<char> ReadFile(const std::string& filename)
 {
   FILE* file = fopen(filename.c_str(), "rb");
@@ -87,6 +289,7 @@ int main(int argc, char** argv)
     std::cout << "./RockchipPlayer test.mp4" << std::endl;
     return -1;
   }
+  const std::string filename = argv[1];
 #ifdef _WIN32
 
   //TODO signal thing please
@@ -109,82 +312,6 @@ int main(int argc, char** argv)
     return -3;
   }
 #endif
-  // Open the file
-  std::cout << "Opening the file: " << argv[1] << std::endl;
-  AVFormatContext* format_context = nullptr;
-  if (avformat_open_input(&format_context, argv[1], nullptr, nullptr) != 0)
-  {
-    std::cout << "Failed to open avformat file: " << argv[1] << std::endl;
-    return -4;
-  }
-  BOOST_SCOPE_EXIT(format_context)
-  {
-    avformat_close_input(&format_context);
-  }
-  BOOST_SCOPE_EXIT_END
-  if (avformat_find_stream_info(format_context, nullptr) < 0)
-  {
-    std::cout << "Failed to find stream info: " << argv[1] << std::endl;
-    return -5;
-  }
-  std::optional<unsigned int> videostream;
-  for (unsigned int i = 0; i < format_context->nb_streams; i++)
-  {
-    if ((format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) && (format_context->streams[i]->codecpar->codec_id == AVCodecID::AV_CODEC_ID_H264)) // Currently only support H264
-    {
-      videostream = i;
-      break;
-    }
-  }
-  if (!videostream.has_value())
-  {
-    std::cout << "Failed to find video stream: " << argv[1] << std::endl;
-    return -6;
-  }
-  // Find SPS/PPS if available and pass it to the decoder
-  std::vector<uint8_t> spspps;
-  if (format_context->streams[*videostream]->codecpar->extradata && format_context->streams[*videostream]->codecpar->extradata_size)
-  {
-    const std::vector<uint8_t> extradata(format_context->streams[*videostream]->codecpar->extradata, format_context->streams[*videostream]->codecpar->extradata + format_context->streams[*videostream]->codecpar->extradata_size);
-    if (extradata.size())
-    {
-      if (extradata[0] >= 1) // SPS+PPS count, but we only care about the first one
-      {
-        const int spscount = extradata[5] & 0x1f;
-        const int spsnalsize = (extradata[6] << 8) | extradata[7];
-        if ((spsnalsize + 8) <= extradata.size())
-        {
-          std::cout << "Gathering SPS: " << spsnalsize << std::endl;
-          spspps.insert(spspps.end(), extradata.data() + 8, extradata.data() + 8 + spsnalsize);
-          if ((spsnalsize + 8 + 1) <= extradata.size())
-          {
-            const int ppscount = extradata[8 + spsnalsize] & 0x1f;
-            if (ppscount >= 1)
-            {
-              if ((spsnalsize + 8 + 1 + 2) < extradata.size())
-              {
-                const int ppsnalsize = (extradata[8 + spsnalsize + 1] << 8) | extradata[8 + spsnalsize + 2];
-                if ((spsnalsize + 8 + 1 + 2 + ppsnalsize) <= extradata.size())
-                {
-                  std::cout << "Gathering PPS: " << ppsnalsize << std::endl;
-                  spspps.insert(spspps.end(), H264_START_SEQUENCE, H264_START_SEQUENCE + sizeof(H264_START_SEQUENCE));
-                  spspps.insert(spspps.end(), extradata.data() + 8 + spsnalsize + 3, extradata.data() + 8 + spsnalsize + 3 + ppsnalsize);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  if (spspps.size())
-  {
-//TODO?
-  }
-  // Set libdatachannel components
-  
-  //TODO probably not needed?
-
   // Setup HTTP server
   std::shared_ptr<httplib::Server> http_server = std::make_shared<httplib::Server>();
   http_server->set_tcp_nodelay(true);
@@ -193,9 +320,8 @@ int main(int argc, char** argv)
                           const std::vector<char> index = ReadFile("index.html");
                           res.set_content(index.data(), index.size(), "text/html");
                         });
-  std::vector<std::shared_ptr<rtc::PeerConnection>> peer_connections;//TODO store nicely
-  std::vector<std::shared_ptr<rtc::Track>> rtcvideotracks;//TODO store nicely
-  http_server->Post("/call", [&peer_connections, &rtcvideotracks](const httplib::Request& req, httplib::Response& res)
+  std::vector<std::shared_ptr<Connection>> connections;
+  http_server->Post("/call", [filename, &connections](const httplib::Request& req, httplib::Response& res)
                              {
                                // Parse JSON request
                                const nlohmann::json body = nlohmann::json::parse(req.body);
@@ -206,32 +332,32 @@ int main(int argc, char** argv)
                                  return false;
                                }
                                // Create peer connection
-                               std::shared_ptr<rtc::PeerConnection> peer_connection = std::make_shared<rtc::PeerConnection>();
+                               std::shared_ptr<Connection> connection = std::make_shared<Connection>(filename);
                                std::promise<std::string> promise;
-                               peer_connection->onGatheringStateChange([peer_connection, &promise](rtc::PeerConnection::GatheringState state)
-                                                                       {
-                                                                         if (state == rtc::PeerConnection::GatheringState::Complete)
-                                                                         {
-                                                                           std::optional<rtc::Description> localdescription = peer_connection->localDescription();
-                                                                           promise.set_value(localdescription->generateSdp());
-                                                                         }
-                                                                       });
-                               peer_connection->onStateChange([](rtc::PeerConnection::State state)
-                                                              {
-                                                                if ((state == rtc::PeerConnection::State::Disconnected) || (state == rtc::PeerConnection::State::Failed) || (state == rtc::PeerConnection::State::Closed))
-                                                                {
-                                                                  int i = 0;//TODO tidy it up? with mutex?
-                                                                }
-                                                                else
-                                                                {
-                                                                  int j = 0;//TODO
-                                                                }
-                                                              });
-                               peer_connection->onTrack([](const std::shared_ptr<rtc::Track>& track) {});
-                               peer_connection->onIceStateChange([](rtc::PeerConnection::IceState state) {});
-                               peer_connection->onSignalingStateChange([](rtc::PeerConnection::SignalingState state) {});
+                               connection->peer_connection_->onGatheringStateChange([connection, &promise](rtc::PeerConnection::GatheringState state)
+                                                                                    {
+                                                                                      if (state == rtc::PeerConnection::GatheringState::Complete)
+                                                                                      {
+                                                                                        std::optional<rtc::Description> localdescription = connection->peer_connection_->localDescription();
+                                                                                        promise.set_value(localdescription->generateSdp());
+                                                                                      }
+                                                                                    });
+                               connection->peer_connection_->onStateChange([](rtc::PeerConnection::State state)
+                                                                           {
+                                                                             if ((state == rtc::PeerConnection::State::Disconnected) || (state == rtc::PeerConnection::State::Failed) || (state == rtc::PeerConnection::State::Closed))
+                                                                             {
+                                                                               int i = 0;//TODO tidy it up? with mutex?
+                                                                             }
+                                                                             else
+                                                                             {
+                                                                               int j = 0;//TODO remove
+                                                                             }
+                                                                           });
+                               //TODO remove these
+                               connection->peer_connection_->onTrack([](const std::shared_ptr<rtc::Track>& track) {});
+                               connection->peer_connection_->onIceStateChange([](rtc::PeerConnection::IceState state) {});
+                               connection->peer_connection_->onSignalingStateChange([](rtc::PeerConnection::SignalingState state) {});
                                // Parse SDP request
-                               //TODO probably create some kind of class to hold all this
                                rtc::Description remotedescription = rtc::Description(sdp->get<std::string>(), rtc::Description::Type::Offer);
                                for (unsigned int i = 0; i < remotedescription.mediaCount(); ++i)
                                {
@@ -294,132 +420,45 @@ int main(int argc, char** argv)
                                          rtc::Description::Video videodescription = rtc::Description::Video(video->mid());
                                          videodescription.addSSRC(1, "video");
                                          videodescription.addH264Codec(payloadtype, rtpmap->fmtps[0]);
-                                         std::shared_ptr<rtc::Track> rtcvideotrack = peer_connection->addTrack(videodescription);
-                                         if (rtcvideotrack == nullptr)
+                                         connection->rtcvideotrack_ = connection->peer_connection_->addTrack(videodescription);
+                                         if (connection->rtcvideotrack_ == nullptr)
                                          {
                                            return false;
                                          }
                                          std::shared_ptr<rtc::RtpPacketizationConfig> videortpconfig = std::make_shared<rtc::RtpPacketizationConfig>(1, "video", payloadtype, rtc::H264RtpPacketizer::defaultClockRate);
                                          std::shared_ptr<rtc::H264PacketizationHandler> h264handler = std::make_shared<rtc::H264PacketizationHandler>(std::make_shared<rtc::H264RtpPacketizer>(rtc::H264RtpPacketizer::Separator::LongStartSequence, videortpconfig));
-                                         std::shared_ptr<rtc::RtcpSrReporter> videosrreporter = std::make_shared<rtc::RtcpSrReporter>(videortpconfig);
-                                         h264handler->addToChain(videosrreporter);
+                                         connection->videosrreporter_ = std::make_shared<rtc::RtcpSrReporter>(videortpconfig);
+                                         h264handler->addToChain(connection->videosrreporter_);
                                          h264handler->addToChain(std::make_shared<rtc::RtcpNackResponder>());
-                                         rtcvideotrack->setMediaHandler(h264handler);
-                                         rtcvideotrack->onOpen([]() {
-                                           int i = 0;//TODO         
-                                                                      //TODO if (std::shared_ptr<WebRTCClient> c = wc.lock())
-                                                                      //TODO {
-                                                                      //TODO   c->strand_.post([wc]()
-                                                                      //TODO     {
-                                                                      //TODO       if (std::shared_ptr<WebRTCClient> c = wc.lock())
-                                                                      //TODO       {
-                                                                      //TODO         c->SetVideoReady();//TODO inside this we need to start the video reading etc
-                                                                      //TODO       }
-                                                                      //TODO     });
-                                                                      //TODO }
-                                                                    });
-                                         rtcvideotracks.push_back(rtcvideotrack);
-                                         break;
+                                         connection->rtcvideotrack_->setMediaHandler(h264handler);
+                                         connection->rtcvideotrack_->onOpen([connection]()
+                                                                            {
+                                                                              connection->videosrreporter_->rtpConfig->startTimestamp = 0;
+                                                                              connection->Start();
+                                                                            });
+                                         // Process
+                                         connection->peer_connection_->setRemoteDescription(remotedescription);
+                                         connection->peer_connection_->setLocalDescription();
+                                         connections.push_back(connection);
+                                         // Respond
+                                         const std::string sdp_response = promise.get_future().get();
+                                         nlohmann::json response;
+                                         response["sdp"] = sdp_response;
+                                         res.set_content(response.dump(), "application/json");
+                                         return true;
                                        }
                                      }
                                    }
                                  }
                                }
-
-                               //TODO if we didn't find anything, error here
-
-                               // Process SDP
-                               peer_connection->setRemoteDescription(remotedescription);
-                               peer_connection->setLocalDescription();
-                               // Respond
-                               const std::string sdp_response = promise.get_future().get();
-                               nlohmann::json response;
-                               response["sdp"] = sdp_response;
-                               res.set_content(response.dump(), "application/json");
-                               peer_connections.push_back(peer_connection);//TODO
-                               return true;
+                               return false;
                              });
   std::thread thread([http_server]() { http_server->listen("0.0.0.0", 80); });
   // Provide user information
 
 
 //TODO output addresses here and links to see this website
-
-  // Start main loop
-  std::cout << "Starting main loop" << std::endl;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-  static double time_base = static_cast<double>(format_context->streams[*videostream]->time_base.num) / static_cast<double>(format_context->streams[*videostream]->time_base.den);
-  AVPacket* av_packet = nullptr;
-  BOOST_SCOPE_EXIT(&av_packet)
-  {
-    if (av_packet)
-    {
-      av_packet_free(&av_packet);
-    }
-  }
-  BOOST_SCOPE_EXIT_END
-  while (running)
-  {
-    // Calculate time of frame
-    if (av_packet)
-    {
-      const double av_packet_time = static_cast<double>(av_packet->pts) * time_base;
-      const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-      if (now >= (start + std::chrono::milliseconds(static_cast<int>(av_packet_time * 1000.0))))
-      {
-        av_packet_free(&av_packet);
-      }
-    }
-    // Read frame from file
-    if (av_packet == nullptr)
-    {
-      av_packet = av_packet_alloc();
-      int ret = av_read_frame(format_context, av_packet);
-      if (ret == AVERROR_EOF)
-      {
-        ret = av_seek_frame(format_context, *videostream, 0, AVSEEK_FLAG_ANY);
-        if (ret < 0)
-        {
-          std::cout << "Failed to seek frame" << std::endl;
-          return -26;
-        }
-        start = std::chrono::steady_clock::now();
-      }
-      else if (ret)
-      {
-        std::cout << "Failed to seek frame" << std::endl;
-        return -27;
-      }
-      // Video
-      if (av_packet->stream_index != *videostream)
-      {
-        av_packet_free(&av_packet);
-        continue;
-      }
-      // Send
-      const uint8_t* ptr = av_packet->data;
-      size_t size = av_packet->size;
-      while (size > 5)
-      {
-        const uint32_t nal_size = htonl(*reinterpret_cast<const uint32_t*>(ptr));
-        ptr += 4;
-        size -= 4;
-        if (nal_size > size)
-        {
-          std::cout << "Illegal NAL size " << nal_size << std::endl;
-          break;
-        }
-		
-        //TODO std::cout << nal_size << std::endl;//TODO
-//TODO now do something with the frame
-		
-        ptr += nal_size;
-        size -= nal_size;
-      }
-    }
-    // Delay loop
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  thread.join();//TODO
   // Clear up
   
 //TODO clean up peer connections
