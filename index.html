@@ -1,0 +1,95 @@
+<html>
+<head>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<button onclick="Play()">Play</button>
+<video id="video" autoplay="true" playsinline="true" width="480" height="360" disablepictureinpicture="true"></video>
+</body>
+<script>
+function RandomString()//TODO not used right?
+{
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012346789";
+  let random = '';
+  for (let i = 0; i < 12 ; i++)
+  {
+    random += chars[parseInt(Math.random() * chars.length)];
+  }
+  return random;
+}
+function Play()
+{
+// WebRTC connection
+var video_element = document.getElementById("video");
+const peer_id = RandomString();//TODO not used right?
+const pc = new RTCPeerConnection();
+//TODO tidy below
+pc.ontrack = (ev) =>
+{
+console.log("TEST", ev.streams);//TODO
+video_element.srcObject = ev.streams[0];
+video_element.play().then(() =>
+{
+video_element.controls = false;
+video_element.style.opacity = "1.0";
+});
+  //TODO ev.streams.forEach((stream) => onAddStream(stream));
+};
+pc.addTransceiver('video', { direction: 'recvonly' });
+  
+  
+  pc.onicecandidate = (evt) =>
+  {
+console.log("onicecandidate ", evt);
+    if (evt.candidate) {
+      if (pc.currentRemoteDescription) {
+      } else {
+      }
+    } else {
+      console.log("End of candidates.");
+    }
+  };
+
+pc.onicegatheringstatechange = () =>
+                               {
+                                 if (pc.iceGatheringState === "complete")
+                                 {
+                                   fetch("/call", { method: "POST", body: JSON.stringify({ id: peer_id, sdp: pc.localDescription.sdp }) }).then(response => response.json()).then(data =>
+{
+  const descr = new RTCSessionDescription({
+    sdp: data.sdp,
+    type: "answer",
+  });
+console.log("onReceiveCall ", descr);//TODO
+//TODO does this require promise thing?
+  pc.setRemoteDescription(descr, () =>
+    {
+      console.log("setRemoteDescription ok");//TODO
+    },
+    (error) =>//TODO remove ignore
+    {
+      console.log("setRemoteDescription error", { error });
+    }
+  );
+})
+                                 }
+                               };
+pc.createOffer({
+                 // sdpSemantics: "unified-plan",
+                 // bundlePolicy: "max-bundle",
+                 voiceActivityDetection: false,
+                 offerToReceiveVideo: true
+               }).then((session_sescription) =>
+                       {
+                         pc.setLocalDescription(session_sescription).then(function()
+                         {
+//TODO check we have finished gathering is "complete", then we can "call_webrtc" here too
+                         });
+                       },
+                       (error) =>//TODO remove ignore
+                       {
+                         alert("Create offer error:" + JSON.stringify(error));
+                       });
+}
+</script>
+</html>
