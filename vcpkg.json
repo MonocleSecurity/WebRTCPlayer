@@ -1,0 +1,40 @@
+{
+  "name": "monocle",
+  "version-string": "1.0.0",
+  "dependencies": [
+    {
+      "name": "boost-algorithm"
+    },
+    {
+      "name": "boost-optional"
+    },
+    {
+      "name": "boost-scope-exit"
+    },
+    {
+      "name": "cpp-httplib"
+    },
+    {
+      "name": "ffmpeg",
+      "features": [
+        "avcodec",
+        "avdevice",
+        "avfilter",
+        "avresample",
+        "nonfree",
+        "opus",
+        "swresample",
+        "swscale"
+      ]
+    },
+    {
+      "name": "libdatachannel",
+      "features": [
+        "srtp"
+      ]
+    },
+    {
+      "name": "nlohmann-json"
+    }
+  ]
+}

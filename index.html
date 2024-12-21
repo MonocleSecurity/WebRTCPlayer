@@ -1,0 +1,38 @@
+<html>
+<head>
+<link rel="icon" href="data:,">
+</head>
+<body>
+<button onclick="Play()">Play</button>
+<video id="video" autoplay="true" playsinline="true" width="480" height="360" disablepictureinpicture="true"></video>
+</body>
+<script>
+function Play()
+{
+  var video_element = document.getElementById("video");
+  const pc = new RTCPeerConnection();
+  pc.ontrack = (ev) =>
+  {
+    video_element.srcObject = ev.streams[0];
+    video_element.play().then(() =>
+  {
+    video_element.controls = false;
+    video_element.style.opacity = "1.0";
+  });
+  };
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.onicecandidate = (evt) => {};
+  pc.onicegatheringstatechange = () => {
+                                         if (pc.iceGatheringState === "complete")
+                                         {
+                                           fetch("/call", { method: "POST", body: JSON.stringify({ sdp: pc.localDescription.sdp }) }).then(response => response.json()).then(data => {
+                                                                                                                                                                                       const descr = new RTCSessionDescription({ sdp: data.sdp, type: "answer" });
+                                                                                                                                                                                       pc.setRemoteDescription(descr);
+                                                                                                                                                                                     })
+                                         }
+                                       };
+  pc.createOffer({ voiceActivityDetection: false, offerToReceiveVideo: true }).then((session_sescription) => { pc.setLocalDescription(session_sescription).then(); },
+                                                                                    (error) => { alert("Create offer error:" + JSON.stringify(error)); });
+}
+</script>
+</html>
