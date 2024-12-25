@@ -1,4 +1,4 @@
-
+#include <boost/algorithm/string.hpp>
 #include <boost/optional.hpp>
 #include <boost/scope_exit.hpp>
 #include <cstring>
@@ -59,7 +59,7 @@ struct Connection
 
   void Start()
   {
-    //TODO store this
+    //TODO store this thread
     std::thread([this]()
       {
         // Open the file
@@ -108,6 +108,7 @@ struct Connection
               if ((spsnalsize + 8) <= extradata.size())
               {
                 std::cout << "Gathering SPS: " << spsnalsize << std::endl;
+                spspps.insert(spspps.end(), H264_START_SEQUENCE, H264_START_SEQUENCE + sizeof(H264_START_SEQUENCE));
                 spspps.insert(spspps.end(), extradata.data() + 8, extradata.data() + 8 + spsnalsize);
                 if ((spsnalsize + 8 + 1) <= extradata.size())
                 {
@@ -147,117 +148,124 @@ struct Connection
           }
         }
         BOOST_SCOPE_EXIT_END
-          // Start main loop
-          while (running)
+        // Start main loop
+        while (running)
+        {
+          // Calculate time of frame
+          if (av_packet)
           {
-            // Calculate time of frame
-            if (av_packet)
+            const double av_packet_time = static_cast<double>(av_packet->pts) * time_base;
+            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+            if (now >= (start + std::chrono::milliseconds(static_cast<int>(av_packet_time * 1000.0))))
             {
-              const double av_packet_time = static_cast<double>(av_packet->pts) * time_base;
-              const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-              if (now >= (start + std::chrono::milliseconds(static_cast<int>(av_packet_time * 1000.0))))
-              {
-                av_packet_free(&av_packet);
-              }
+              av_packet_free(&av_packet);
             }
-            // Read frame from file
-            if (av_packet == nullptr)
+          }
+          // Read frame from file
+          if (av_packet == nullptr)
+          {
+            av_packet = av_packet_alloc();
+            int ret = av_read_frame(format_context, av_packet);
+            if (ret == AVERROR_EOF)
             {
-              av_packet = av_packet_alloc();
-              int ret = av_read_frame(format_context, av_packet);
-              if (ret == AVERROR_EOF)
-              {
-                ret = av_seek_frame(format_context, *videostream, 0, AVSEEK_FLAG_ANY);
-                if (ret < 0)
-                {
-                  std::cout << "Failed to seek frame" << std::endl;
-                  return;
-                }
-                start = std::chrono::steady_clock::now();
-              }
-              else if (ret)
+              ret = av_seek_frame(format_context, *videostream, 0, AVSEEK_FLAG_ANY);
+              if (ret < 0)
               {
                 std::cout << "Failed to seek frame" << std::endl;
                 return;
               }
-              // Video
-              if (av_packet->stream_index != *videostream)
-              {
-                av_packet_free(&av_packet);
-                continue;
-              }
-              // Send
-              const uint8_t* ptr = av_packet->data;
-              size_t size = av_packet->size;
-              while (size > 5)
-              {
-                const uint32_t nal_size = htonl(*reinterpret_cast<const uint32_t*>(ptr));
-                //TODO ptr += 4;
-                //TODO size -= 4;
-                if (nal_size > size)
-                {
-                  std::cout << "Illegal NAL size " << nal_size << std::endl;
-                  break;
-                }
-                if (spspps.size()) // We should always have extra data, but if for some reason we don't, there is no point seeing if we should add nothing
-                {
-                  bool idrslice = false;
-                  bool sps = false;
-                  bool pps = false;
-                  //TODO for (size_t i = 0; i < (buf.size() - 4); ++i)
-                  //TODO {
-                  //TODO   if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
-                  //TODO   {
-                  //TODO     const decoder::H264_NAL_TYPE naltype = static_cast<decoder::H264_NAL_TYPE>(buf[i + 4] & 0x1f);
-                  //TODO     if (naltype == decoder::H264_NAL_TYPE::IDR_SLICE)
-                  //TODO     {
-                  //TODO       idrslice = true;
-                  //TODO       break;
-                  //TODO     }
-                  //TODO     else if (naltype == decoder::H264_NAL_TYPE::SPS)
-                  //TODO     {
-                  //TODO       sps = true;
-                  //TODO     }
-                  //TODO     else if (naltype == decoder::H264_NAL_TYPE::PPS)
-                  //TODO     {
-                  //TODO       pps = true;
-                  //TODO     }
-                  //TODO   }
-                  //TODO }
-                  //TODO if (idrslice && (sps == false) && (pps == false)) // If we are an iframe and we don't have an sps or pps before the IDR, then insert the sprop-parameter-set extra adata SPS and PPS
-                  //TODO {
-                  //TODO   buf.insert(buf.begin(), extradata.begin(), extradata.end());
-                  //TODO }
-                }
-                auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();//TODO
-                double elapsed;
-                if (prevvideotimestamp_)
-                {
-                  elapsed = static_cast<double>(timestamp - prevvideotimestamp_) / 1000.0;
-                }
-                else
-                {
-                  elapsed = 0.0;
-                }
-                prevvideotimestamp_ = timestamp;
-                videosrreporter_->rtpConfig->timestamp += videosrreporter_->rtpConfig->secondsToTimestamp(elapsed);
-                const uint32_t reportedelapsed = videosrreporter_->rtpConfig->timestamp - videosrreporter_->lastReportedTimestamp();
-                if (videosrreporter_->rtpConfig->timestampToSeconds(reportedelapsed) > 1.0) // RTCP report every second
-                {
-                  videosrreporter_->setNeedsToReport();
-                }
-                auto a = rtcvideotrack_->send(reinterpret_cast<const std::byte*>(ptr), size);
-                //TODO
-                std::cout << (a ? "true" : "false") << nal_size << " " << (int)ptr[0] << " " << (int)ptr[1] << " " << (int)ptr[2] << " " << (int)ptr[3] << " " << (int)ptr[4] << " " << std::endl;//TODO
-                //TODO now do something with the frame
-
-                ptr += nal_size;
-                size -= nal_size;
-              }
+              start = std::chrono::steady_clock::now();
             }
-            // Delay loop
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            else if (ret)
+            {
+              std::cout << "Failed to seek frame" << std::endl;
+              return;
+            }
+            // Video
+            if (av_packet->stream_index != *videostream)
+            {
+              av_packet_free(&av_packet);
+              continue;
+            }
+            // Send
+            const uint8_t* ptr = av_packet->data;
+            size_t size = av_packet->size;
+            while (size > 5)
+            {
+              const uint32_t nal_size = htonl(*reinterpret_cast<const uint32_t*>(ptr));
+              ptr += 4;
+              size -= 4;
+              if (nal_size > size)
+              {
+                std::cout << "Illegal NAL size " << nal_size << std::endl;
+                break;
+              }
+
+              std::vector<std::byte> buf;
+              //TODO buf.insert(buf.begin(), (std::byte*)spspps.data(), (std::byte*)spspps.data() + spspps.size());//TODO
+              buf.insert(buf.end(), (std::byte*)H264_START_SEQUENCE, (std::byte*)H264_START_SEQUENCE + sizeof(H264_START_SEQUENCE));
+              buf.insert(buf.begin(), (std::byte*)ptr, (std::byte*)ptr + size);
+
+              if (spspps.size()) // We should always have extra data, but if for some reason we don't, there is no point seeing if we should add nothing
+              {
+                bool idrslice = false;
+                bool sps = false;
+                bool pps = false;
+                //TODO for (size_t i = 0; i < (buf.size() - 4); ++i)
+                //TODO {
+                //TODO   if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1)
+                //TODO   {
+                //TODO     const decoder::H264_NAL_TYPE naltype = static_cast<decoder::H264_NAL_TYPE>(buf[i + 4] & 0x1f);
+                //TODO     if (naltype == decoder::H264_NAL_TYPE::IDR_SLICE)
+                //TODO     {
+                //TODO       idrslice = true;
+                //TODO       break;
+                //TODO     }
+                //TODO     else if (naltype == decoder::H264_NAL_TYPE::SPS)
+                //TODO     {
+                //TODO       sps = true;
+                //TODO     }
+                //TODO     else if (naltype == decoder::H264_NAL_TYPE::PPS)
+                //TODO     {
+                //TODO       pps = true;
+                //TODO     }
+                //TODO   }
+                //TODO }
+                //TODO if (idrslice && (sps == false) && (pps == false)) // If we are an iframe and we don't have an sps or pps before the IDR, then insert the sprop-parameter-set extra adata SPS and PPS
+                //TODO {
+                //TODO   buf.insert(buf.begin(), extradata.begin(), extradata.end());
+                //TODO }
+              }
+              auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();//TODO
+              double elapsed;
+              if (prevvideotimestamp_)
+              {
+                elapsed = static_cast<double>(timestamp - prevvideotimestamp_) / 1000.0;
+              }
+              else
+              {
+                elapsed = 0.0;
+              }
+              prevvideotimestamp_ = timestamp;
+              videosrreporter_->rtpConfig->timestamp += videosrreporter_->rtpConfig->secondsToTimestamp(elapsed);
+              const uint32_t reportedelapsed = videosrreporter_->rtpConfig->timestamp - videosrreporter_->lastReportedTimestamp();
+              if (videosrreporter_->rtpConfig->timestampToSeconds(reportedelapsed) > 1.0) // RTCP report every second
+              {
+                videosrreporter_->setNeedsToReport();
+              }
+              //TODO auto a = rtcvideotrack_->send(reinterpret_cast<const std::byte*>(ptr), size);
+              auto a = rtcvideotrack_->send(reinterpret_cast<const std::byte*>(buf.data()), buf.size());
+              //TODO
+              std::cout << (a ? "true " : "false ") << elapsed << " " << videosrreporter_->rtpConfig->timestamp << " " << nal_size << " " << (int)ptr[0] << " " << (int)ptr[1] << " " << (int)ptr[2] << " " << (int)ptr[3] << " " << (int)ptr[4] << " " << std::endl;//TODO
+              //TODO now do something with the frame
+
+              ptr += nal_size;
+              size -= nal_size;
+            }
           }
+          // Delay loop
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
       }).detach();//TODO
   }
 
@@ -400,41 +408,38 @@ int main(int argc, char** argv)
                                          {
                                            continue;
                                          }
-                                         //TODO std::vector<std::string> elements;
-                                         //TODO boost::split(elements, rtpmap->fmtps[0], boost::is_any_of(";"));
-                                         //TODO // It must be packetization-mode 1, because it supports the packetization model of the library
-                                         //TODO std::vector<std::string>::const_iterator packetizationmode = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::iequals(element, "packetization-mode=1"); }); // Must be explicitly 1 because default is 0
-                                         //TODO if (packetizationmode == elements.cend())
-                                         //TODO {
-                                         //TODO   continue;
-                                         //TODO }
-                                         //TODO std::vector<std::string>::const_iterator levelasymmetryallowed = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::iequals(element, "level-asymmetry-allowed=1"); });
-                                         //TODO // If must be baseline, main or high profile
-                                         //TODO std::vector<std::string>::const_iterator profilelevelid = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::istarts_with(element, "profile-level-id="); });
-                                         //TODO if (profilelevelid == elements.cend())
-                                         //TODO {
-                                         //TODO   continue;
-                                         //TODO }
-                                         //TODO std::string type;
-                                         //TODO if (boost::istarts_with(profilelevelid->substr(17), "4d"))
-                                         //TODO {
-                                         //TODO   type = "4d"; // Baseline
-                                         //TODO }
-                                         //TODO else if (boost::istarts_with(profilelevelid->substr(17), "42"))
-                                         //TODO {
-                                         //TODO   type = "42"; // Main
-                                         //TODO }
-                                         //TODO else if (boost::istarts_with(profilelevelid->substr(17), "64"))
-                                         //TODO {
-                                         //TODO   type = "64"; // High
-                                         //TODO }
-                                         //TODO else
-                                         //TODO {
-                                         //TODO   continue;
-                                         //TODO }
-
-
-
+                                         std::vector<std::string> elements;
+                                         boost::split(elements, rtpmap->fmtps[0], boost::is_any_of(";"));
+                                         // It must be packetization-mode 1, because it supports the packetization model of the library
+                                         std::vector<std::string>::const_iterator packetizationmode = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::iequals(element, "packetization-mode=1"); }); // Must be explicitly 1 because default is 0
+                                         if (packetizationmode == elements.cend())
+                                         {
+                                           continue;
+                                         }
+                                         std::vector<std::string>::const_iterator levelasymmetryallowed = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::iequals(element, "level-asymmetry-allowed=1"); });
+                                         // If must be baseline, main or high profile
+                                         std::vector<std::string>::const_iterator profilelevelid = std::find_if(elements.cbegin(), elements.cend(), [](const std::string& element) { return boost::istarts_with(element, "profile-level-id="); });
+                                         if (profilelevelid == elements.cend())
+                                         {
+                                           continue;
+                                         }
+                                         std::string type;
+                                         if (boost::istarts_with(profilelevelid->substr(17), "4d"))
+                                         {
+                                           type = "4d"; // Baseline
+                                         }
+                                         else if (boost::istarts_with(profilelevelid->substr(17), "42"))
+                                         {
+                                           type = "42"; // Main
+                                         }
+                                         else if (boost::istarts_with(profilelevelid->substr(17), "64"))
+                                         {
+                                           type = "64"; // High
+                                         }
+                                         else
+                                         {
+                                           continue;
+                                         }
                                          // Add the video track
                                          rtc::Description::Video videodescription = rtc::Description::Video(video->mid());
                                          videodescription.addSSRC(1, "video");

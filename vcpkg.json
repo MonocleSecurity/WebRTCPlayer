@@ -3,6 +3,9 @@
   "version-string": "1.0.0",
   "dependencies": [
     {
+      "name": "boost-algorithm"
+    },
+    {
       "name": "boost-optional"
     },
     {

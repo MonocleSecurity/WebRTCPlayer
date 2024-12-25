@@ -4,6 +4,7 @@ set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/
 
 project(WebRTCPlayer C CXX)
 
+find_package(boost_algorithm CONFIG REQUIRED)
 find_package(boost_scope_exit CONFIG REQUIRED)
 find_package(boost_optional CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
@@ -20,6 +21,7 @@ target_include_directories(WebRTCPlayer PRIVATE ${FFMPEG_INCLUDE_DIRS})
 target_link_directories(WebRTCPlayer PRIVATE ${FFMPEG_LIBRARY_DIRS})
 
 target_link_libraries(WebRTCPlayer ${FFMPEG_LIBRARIES})
+target_link_libraries(WebRTCPlayer Boost::algorithm)
 target_link_libraries(WebRTCPlayer Boost::optional)
 target_link_libraries(WebRTCPlayer Boost::scope_exit)
 target_link_libraries(WebRTCPlayer httplib::httplib)
