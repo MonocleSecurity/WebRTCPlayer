@@ -1,7 +1,7 @@
 WebRTCPlayer README
 ====================
 
-WebRTCPlayer is a simple application for playing video files via WebRTC.
+WebRTCPlayer is a simple application for playing video files via WebRTC to a browser.
 
 ## Build
 
